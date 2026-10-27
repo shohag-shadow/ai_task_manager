@@ -129,3 +129,28 @@ def delete_task(task_id: str) -> dict:
             return {"ok": False, "error": "NOT_FOUND",
                     "message": f"Task {task_id} not found."}
     return {"ok": True, "task_id": task_id}
+
+
+def keyword_search(query: str, limit: int = 5) -> list[dict]:
+    like = f"%{query.lower()}%"
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM tasks
+                WHERE LOWER(title) LIKE ? OR LOWER(description) LIKE ?
+                LIMIT ?""",
+            (like, like, limit),
+        ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def hydrate(ids: list[str]) -> list[dict]:
+    """Return the tasks for these ids, dropping any that no longer exist."""
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM tasks WHERE id IN ({placeholders})", ids
+        ).fetchall()
+    by_id = {r["id"]: _row_to_dict(r) for r in rows}
+    return [by_id[i] for i in ids if i in by_id]
