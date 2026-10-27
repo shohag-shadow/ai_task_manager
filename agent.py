@@ -199,3 +199,78 @@ def call_model(state: State) -> State:
         ]
 
     return {"messages": state["messages"] + [out]}
+
+
+def _compact(tasks: list[dict]) -> list[dict]:
+    return [
+        {
+            "id": t["id"],
+            "title": t["title"],
+            "description": t.get("description"),
+            "status": t["status"],
+            "priority": t["priority"],
+            "due_date": t.get("due_date"),
+        }
+        for t in tasks
+    ]
+
+
+def _exec_create(args: dict) -> dict:
+    result = db.create_task(
+        title=args["title"],
+        description=args.get("description"),
+        status=args.get("status", "todo"),
+        priority=args.get("priority", "medium"),
+        due_date=args.get("due_date"),
+    )
+    if result["ok"]:
+        vector_store.upsert(result["task"])
+    return result
+
+
+def _exec_list(args: dict) -> dict:
+    tasks = db.list_tasks(status=args.get("status"), priority=args.get("priority"))
+    return {"ok": True, "count": len(tasks), "tasks": _compact(tasks)}
+
+
+def _exec_find(args: dict) -> dict:
+    query = args["query"]
+    vec = vector_store.search(query, n=10)
+    vec_ids = [tid for tid, _ in vec]
+    kw = db.keyword_search(query, limit=10)
+    kw_ids = [t["id"] for t in kw]
+
+    seen = set()
+    ids: list[str] = []
+    for tid in vec_ids + kw_ids:
+        if tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+
+    tasks = db.hydrate(ids)[:5]
+    return {"ok": True, "count": len(tasks), "tasks": _compact(tasks)}
+
+
+def _exec_update(args: dict) -> dict:
+    args = dict(args)
+    task_id = args.pop("task_id")
+    result = db.update_task(task_id, **args)
+    if result["ok"]:
+        vector_store.upsert(result["task"])
+    return result
+
+
+def _exec_delete(args: dict) -> dict:
+    result = db.delete_task(args["task_id"])
+    if result["ok"]:
+        vector_store.remove(args["task_id"])
+    return result
+
+
+_TOOL_MAP = {
+    "create_task": _exec_create,
+    "list_tasks": _exec_list,
+    "find_tasks": _exec_find,
+    "update_task": _exec_update,
+    "delete_task": _exec_delete,
+}
