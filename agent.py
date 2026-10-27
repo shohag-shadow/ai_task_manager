@@ -343,6 +343,13 @@ def _ground_reply(reply: str, tool_log: list[dict]) -> str:
     return reply
 
 
+def _extract_reply(last) -> str:
+    """Return the text of the final assistant message."""
+    if isinstance(last, dict):
+        return last.get("content") or ""
+    return getattr(last, "content", "") or ""
+
+
 def run_chat(message: str, history: list[dict]) -> dict:
     init_messages = [{"role": m["role"], "content": m["content"]} for m in history]
     init_messages.append({"role": "user", "content": message})
@@ -350,7 +357,7 @@ def run_chat(message: str, history: list[dict]) -> dict:
     final = app_graph.invoke({"messages": init_messages, "tool_log": []})
     last = final["messages"][-1]
 
-    reply = last.content if hasattr(last, "content") else ""
+    reply = _extract_reply(last)
     tool_log = final.get("tool_log", [])
     reply = _ground_reply(reply, tool_log)
 
