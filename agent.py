@@ -1,7 +1,9 @@
+import json
 import os
 from datetime import date
 from typing import TypedDict
 
+from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
 import db
@@ -274,3 +276,82 @@ _TOOL_MAP = {
     "update_task": _exec_update,
     "delete_task": _exec_delete,
 }
+
+
+def call_tools(state: State) -> State:
+    last = state["messages"][-1]
+    log = list(state.get("tool_log", []))
+    tool_msgs: list[dict] = []
+
+    for tc in (last.get("tool_calls") or []):
+        fn_info = tc.get("function", {})
+        name = fn_info.get("name")
+        try:
+            args = json.loads(fn_info.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+
+        fn = _TOOL_MAP.get(name)
+        if fn is None:
+            result = {"ok": False, "error": "UNKNOWN_TOOL",
+                    "message": f"Unknown tool: {name}"}
+        else:
+            try:
+                result = fn(args)
+            except Exception as e:  # noqa: BLE001
+                result = {"ok": False, "error": "TOOL_ERROR", "message": str(e)}
+
+        log.append({"name": name, "args": args, "result": result})
+        tool_msgs.append({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": json.dumps(result, default=str),
+        })
+
+    return {"messages": state["messages"] + tool_msgs, "tool_log": log}
+
+
+def should_continue(state: State) -> str:
+    last = state["messages"][-1]
+    return "tools" if last.get("tool_calls") else END
+
+
+_graph = StateGraph(State)
+_graph.add_node("agent", call_model)
+_graph.add_node("tools", call_tools)
+_graph.set_entry_point("agent")
+_graph.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+_graph.add_edge("tools", "agent")
+app_graph = _graph.compile()
+
+
+def _ground_reply(reply: str, tool_log: list[dict]) -> str:
+    """Append the saved task details when the reply leaves the title out."""
+    for entry in tool_log:
+        if entry.get("name") not in ("create_task", "update_task"):
+            continue
+        r = entry.get("result") or {}
+        task = r.get("task")
+        if not (r.get("ok") and task):
+            continue
+        title = task["title"]
+        if title.lower() not in reply.lower():
+            due = f", due {task['due_date']}" if task.get("due_date") else ""
+            return (reply.rstrip() +
+                    f"\n\n_(Saved as “{title}” · {task['status']} · "
+                    f"{task['priority']}{due}.)_")
+    return reply
+
+
+def run_chat(message: str, history: list[dict]) -> dict:
+    init_messages = [{"role": m["role"], "content": m["content"]} for m in history]
+    init_messages.append({"role": "user", "content": message})
+
+    final = app_graph.invoke({"messages": init_messages, "tool_log": []})
+    last = final["messages"][-1]
+
+    reply = last.content if hasattr(last, "content") else ""
+    tool_log = final.get("tool_log", [])
+    reply = _ground_reply(reply, tool_log)
+
+    return {"reply": reply or "", "tool_log": tool_log}
