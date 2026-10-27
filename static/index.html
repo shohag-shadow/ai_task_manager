@@ -33,6 +33,15 @@
         </button>
       </form>
     </section>
+
+    <!-- Task list -->
+    <section class="lg:col-span-2 bg-white rounded-xl shadow flex flex-col min-h-0">
+      <div class="p-3 border-b flex items-center justify-between">
+        <h2 class="font-semibold">Tasks</h2>
+        <button id="refresh-btn" class="text-xs text-indigo-600 hover:underline">Refresh</button>
+      </div>
+      <div id="tasks" class="flex-1 overflow-y-auto chat-scroll p-3 space-y-2"></div>
+    </section>
   </div>
 </div>
 
