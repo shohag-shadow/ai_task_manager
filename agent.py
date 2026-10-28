@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -11,6 +12,8 @@ from openai import OpenAI
 import db
 import vector_store
 
+log = logging.getLogger(__name__)
+
 MODEL = os.getenv("MODEL_NAME", "gpt-4o-mini")
 _client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
@@ -21,6 +24,8 @@ STATUSES = ("todo", "in_progress", "done")
 ACTIVE = ("todo", "in_progress")
 PRIORITIES = ("low", "medium", "high", "urgent")
 UPDATABLE = ("title", "description", "status", "priority", "due_date")
+STATUS_LABEL = {"todo": "To do", "in_progress": "In progress", "done": "Done"}
+LIST_LIMIT = 30  # most tasks shown in one list reply
 
 # Semantic cutoff. Assumes vector_store.search returns (id, distance) with lower = closer.
 # If it returns a similarity score instead, flip the comparison in _search().
@@ -42,7 +47,7 @@ SYSTEM_PROMPT = """You are a task manager assistant. You manage tasks ONLY throu
 
 4. DELETE: call delete_tasks. Use `query` for one specific task. For bulk requests use filters, e.g. "delete all finished tasks" -> status "done" and all_matching true. The tool asks the user to confirm, so never say anything was deleted yourself.
 
-5. LIST / SEARCH: use list_tasks for "show/list" requests (with status/priority filters if given) and find_tasks for descriptive queries like "tasks related to X".
+5. LIST / SEARCH: use list_tasks for "show/list" requests and find_tasks for descriptive queries like "tasks related to X". Only pass a status or priority filter when the user names one. "my tasks", "show tasks" and "all tasks" mean NO filter. These tools write the final reply themselves, so do not add to it.
 
 6. VALUES: statuses are todo, in_progress, done ("in progress" -> in_progress, "complete" -> done). Priorities are low, medium, high, urgent.
 
@@ -69,9 +74,12 @@ TOOLS = [
           {"title": _text, "description": _text, "status": _status,
            "priority": _priority, "due_date": _due},
           required=("title",)),
-    _tool("list_tasks", "List tasks, optionally filtered by status or priority.",
+    _tool("list_tasks",
+          "List tasks. Set status or priority ONLY if the user named one. "
+          "For \"my tasks\" or \"all tasks\" pass no filter.",
           {"status": _status, "priority": _priority}),
-    _tool("find_tasks", "Search tasks by keyword or natural language.",
+    _tool("find_tasks",
+          "Search tasks by keyword or natural language. Set status ONLY if the user named one.",
           {"query": _text, "status": _status},
           required=("query",)),
     _tool("update_task",
@@ -112,18 +120,64 @@ def _validate(name: str, args: dict) -> str | None:
 
 # --------------------------------------------------------------------------- helpers
 
-def _compact(tasks: list[dict], with_description: bool = False) -> list[dict]:
-    rows = []
-    for t in tasks:
-        row = {k: t.get(k) for k in ("id", "title", "status", "priority", "due_date")}
-        if with_description:
-            row["description"] = (t.get("description") or "")[:120] or None
-        rows.append(row)
-    return rows
+# Words that count as the user naming a status or priority.
+_FILTER_WORDS = {
+    "todo": r"\bto[- ]?do\b",
+    "in_progress": r"\bin[- ]?progress\b|\bongoing\b",
+    "done": r"\bdone\b|\bcomplete[d]?\b|\bfinished\b",
+    "low": r"\blow\b",
+    "medium": r"\bmedium\b",
+    "high": r"\bhigh\b",
+    "urgent": r"\burgent\b",
+}
 
 
-def _numbered(tasks: list[dict]) -> str:
-    return "\n".join(f"{i}. '{t['title']}' ({t['status']})" for i, t in enumerate(tasks, 1))
+def _last_user_text(messages: list[dict]) -> str:
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return m.get("content") or ""
+    return ""
+
+
+def _drop_unrequested_filters(args: dict, user_text: str) -> dict:
+    """Models like to add status='todo' on their own. Keep a list/search filter only
+    if the user's message actually names it, so "list all my tasks" is never narrowed."""
+    text = user_text.lower()
+    return {k: v for k, v in args.items()
+            if k not in ("status", "priority") or re.search(_FILTER_WORDS.get(v, "$^"), text)}
+
+
+def _compact(tasks: list[dict]) -> list[dict]:
+    keys = ("id", "title", "status", "priority", "due_date")
+    return [{k: t.get(k) for k in keys} for t in tasks]
+
+
+def _tasks_word(n: int) -> str:
+    return f"{n} task" if n == 1 else f"{n} tasks"
+
+
+def _numbered(tasks: list[dict], limit: int = 5) -> str:
+    lines = [f"{i}. '{t['title']}' ({t['status']})" for i, t in enumerate(tasks[:limit], 1)]
+    if len(tasks) > limit:
+        lines.append(f"...and {len(tasks) - limit} more. Please be more specific.")
+    return "\n".join(lines)
+
+
+def _render_tasks(tasks: list[dict], header: str) -> str:
+    """Plain-text list grouped by status. Written in code so nothing gets left out."""
+    shown = tasks[:LIST_LIMIT]
+    lines = [header]
+    for status in STATUSES:
+        group = [t for t in shown if t["status"] == status]
+        if not group:
+            continue
+        lines.append(f"\n{STATUS_LABEL[status]}:")
+        for t in group:
+            due = f", due {t['due_date']}" if t.get("due_date") else ""
+            lines.append(f"- {t['title']} ({t['priority']}{due})")
+    if len(tasks) > len(shown):
+        lines.append(f"\n...and {len(tasks) - len(shown)} more.")
+    return "\n".join(lines)
 
 
 def _is_duplicate_title_error(exc: Exception) -> bool:
@@ -156,10 +210,10 @@ def _exec_create(args: dict) -> dict:
     try:
         result = db.create_task(
             title=title,
-            description=args.get("description"),
-            status=args.get("status", "todo"),
-            priority=args.get("priority", "medium"),
-            due_date=args.get("due_date"),
+            description=args.get("description") or None,
+            status=args.get("status") or "todo",
+            priority=args.get("priority") or "medium",
+            due_date=args.get("due_date") or None,
         )
     except sqlite3.IntegrityError as e:
         if _is_duplicate_title_error(e):
@@ -173,15 +227,36 @@ def _exec_create(args: dict) -> dict:
 
 
 def _exec_list(args: dict) -> dict:
-    tasks = db.list_tasks(status=args.get("status"), priority=args.get("priority"))
-    return {"ok": True, "count": len(tasks), "truncated": len(tasks) > 20,
-            "tasks": _compact(tasks[:20], with_description=True)}
+    status, priority = args.get("status"), args.get("priority")
+    tasks = db.list_tasks(status=status, priority=priority)
+
+    if status or priority:
+        total = len(db.list_tasks())
+        scope = " and ".join(x for x in (f"status {status}" if status else "",
+                                         f"priority {priority}" if priority else "") if x)
+        if tasks:
+            text = _render_tasks(
+                tasks, f"Showing {len(tasks)} of your {_tasks_word(total)}, only those with {scope}:")
+        else:
+            text = f"No tasks match {scope}. You have {_tasks_word(total)} in total."
+    elif tasks:
+        text = _render_tasks(tasks, f"You have {_tasks_word(len(tasks))}:")
+    else:
+        text = "You have no tasks yet."
+
+    return {"ok": True, "count": len(tasks), "filters": {"status": status, "priority": priority},
+            "tasks": _compact(tasks), "reply": text}
 
 
 def _exec_find(args: dict) -> dict:
-    status = args.get("status")
-    tasks = _search(args["query"], (status,) if status else None)
-    return {"ok": True, "count": len(tasks), "tasks": _compact(tasks[:5])}
+    query, status = args["query"].strip(), args.get("status")
+    tasks = _search(query, (status,) if status else None)
+    scope = f" with status {status}" if status else ""
+    if tasks:
+        text = _render_tasks(tasks, f"Found {_tasks_word(len(tasks))} matching '{query}'{scope}:")
+    else:
+        text = f"No tasks match '{query}'{scope}."
+    return {"ok": True, "count": len(tasks), "tasks": _compact(tasks), "reply": text}
 
 
 def _exec_update(args: dict) -> dict:
@@ -198,15 +273,16 @@ def _exec_update(args: dict) -> dict:
                 "reply": f"I couldn't find a task matching '{query}'."}
     if len(tasks) > 1:
         return {"ok": False, "error": "AMBIGUOUS",
-                "reply": "Which one do you mean?\n" + _numbered(tasks[:5])}
+                "reply": "Which one do you mean?\n" + _numbered(tasks)}
 
     try:
         result = db.update_task(tasks[0]["id"], **fields)
     except sqlite3.IntegrityError as e:
         if _is_duplicate_title_error(e):
+            name = fields.get("title") or tasks[0]["title"]
             return {"ok": False, "error": "DUPLICATE_TITLE",
-                    "reply": f"There's already an active task called '{fields.get('title')}'. "
-                             f"What should it be called instead?"}
+                    "reply": f"There's already an active task called '{name}'. "
+                             f"Pick a different title, or finish that one first."}
         raise
     if result["ok"]:
         vector_store.upsert(result["task"])
@@ -228,7 +304,8 @@ def _exec_delete(args: dict) -> dict:
         return {"ok": False, "error": "MISSING_TARGET", "reply": "Which task should I delete?"}
 
     if query:
-        tasks = [t for t in _resolve(query)
+        found = _search(query) if bulk else _resolve(query)
+        tasks = [t for t in found
                  if (not status or t["status"] == status)
                  and (not priority or t["priority"] == priority)]
     else:
@@ -238,14 +315,14 @@ def _exec_delete(args: dict) -> dict:
         return {"ok": False, "error": "NOT_FOUND", "reply": "I couldn't find any matching tasks."}
     if len(tasks) > 1 and not bulk:
         return {"ok": False, "error": "AMBIGUOUS",
-                "reply": "Which one do you mean?\n" + _numbered(tasks[:5])}
+                "reply": "Which one do you mean?\n" + _numbered(tasks)}
 
     _pending_delete = [{"id": t["id"], "title": t["title"]} for t in tasks]
     if len(tasks) == 1:
         title = tasks[0]["title"]
         text = f"Delete '{title}'? Reply 'yes' to confirm."
     else:
-        text = f"Delete these {len(tasks)} tasks?\n{_numbered(tasks)}\nReply 'yes' to confirm."
+        text = f"Delete these {len(tasks)} tasks?\n{_numbered(tasks, limit=len(tasks))}\nReply 'yes' to confirm."
     return {"ok": True, "needs_confirmation": True, "reply": text}
 
 
@@ -300,6 +377,9 @@ def call_tools(state: State) -> State:
             args = json.loads(tc["function"]["arguments"] or "{}")
         except json.JSONDecodeError:
             args = {}
+
+        if name in ("list_tasks", "find_tasks"):
+            args = _drop_unrequested_filters(args, _last_user_text(state["messages"]))
 
         fn = _TOOL_MAP.get(name)
         problem = _validate(name, args)
@@ -405,7 +485,12 @@ def run_chat(message: str, history: list[dict], last_turn: list[dict] | None = N
     messages = [{"role": m["role"], "content": m["content"]} for m in _trim(history)]
     messages.append({"role": "user", "content": message})
 
-    final = app_graph.invoke({"messages": messages, "tool_log": []})
+    try:
+        final = app_graph.invoke({"messages": messages, "tool_log": []})
+    except Exception:  # noqa: BLE001
+        log.exception("chat request failed")
+        return {"reply": "Sorry, something went wrong on my side. Please try again.",
+                "tool_log": [], "last_turn": None}
     return {
         "reply": final["messages"][-1].get("content") or "",
         "tool_log": final["tool_log"],
