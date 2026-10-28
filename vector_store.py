@@ -42,7 +42,7 @@ _collection = _client.get_or_create_collection(
 
 def _task_text(task: dict) -> str:
     return (
-        f"{task['title']}.{task.get('description') or ''}.Status: {task['status']}. Priority: {task['priority']}."
+        f"{task['title']}.{task.get('description') or ''}.Status: {task['status']}. Priority: {task['priority']}.Due:{task['due_date']}."
     )
 
 

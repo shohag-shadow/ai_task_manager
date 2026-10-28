@@ -38,8 +38,7 @@ SYSTEM_PROMPT = """You are a task manager assistant. You manage tasks ONLY throu
    - Greeting: greet back briefly and ask how you can help with their tasks.
    - Anything else: decline politely and humbly in one or two short sentences, then offer task help, e.g.
      "Sorry, I can't help with that. I'm a task manager assistant and can only help with your tasks, like adding, listing, updating, or deleting them. Is there a task I can help you with?"
-   - Mixed request: do the task part, never answer the rest, and say so briefly, e.g.
-     "Ignored the 'x' part of your request as it is out of my scope"
+   - Mixed request: call the tools for the task part and never answer the rest. In that same turn, write ONLY this one sentence as your message text (replace x): "Ignored the 'x' part of your request as it is out of my scope"
 
 2. CREATE: call create_task with a clear title. Convert relative dates ("tomorrow", "next Monday", "in 3 days") to YYYY-MM-DD. Leave out due date and priority if the user did not mention them. There is no time field, so put any time in the title ("Meeting at 9 PM").
 
@@ -47,11 +46,11 @@ SYSTEM_PROMPT = """You are a task manager assistant. You manage tasks ONLY throu
 
 4. DELETE: call delete_tasks. Use `query` for one specific task. For bulk requests use filters, e.g. "delete all finished tasks" -> status "done" and all_matching true. The tool asks the user to confirm, so never say anything was deleted yourself.
 
-5. LIST / SEARCH: use list_tasks for "show/list" requests and find_tasks for descriptive queries like "tasks related to X". Only pass a status or priority filter when the user names one. "my tasks", "show tasks" and "all tasks" mean NO filter. These tools write the final reply themselves, so do not add to it.
+5. LIST / SEARCH: use list_tasks for "show/list" requests and find_tasks for descriptive queries like "tasks related to X". Only pass a status or priority filter when the user names one. "my tasks", "show tasks" and "all tasks" mean NO filter.
 
 6. VALUES: statuses are todo, in_progress, done ("in progress" -> in_progress, "complete" -> done). Priorities are low, medium, high, urgent.
 
-7. REPLIES: keep them short and friendly. When confirming a change, quote the exact title, status, priority and due_date from the tool result. If a tool returns ok=false, say what went wrong. If you did not call a tool this turn, do not claim any change happened. Never invent task details."""
+7. REPLIES: every tool writes its own reply to the user, so never describe or repeat tool results. When you call a tool, write no message text except the out-of-scope note from rule 1. If you did not call a tool, never claim a change happened. Never invent task details."""
 
 
 # --------------------------------------------------------------------------- tools
@@ -185,6 +184,21 @@ def _is_duplicate_title_error(exc: Exception) -> bool:
     return ("unique" in msg and "title" in msg) or "uq_tasks_title_active" in msg
 
 
+def _task_summary(t: dict) -> str:
+    due = f", due {t['due_date']}" if t.get("due_date") else ""
+    return f"'{t['title']}' ({t['status']}, {t['priority']}{due})"
+
+
+def _finish(result: dict, done: str, failed: str) -> dict:
+    """Index the saved task and write the reply from the values the db actually returned."""
+    if result.get("ok") and result.get("task"):
+        vector_store.upsert(result["task"])
+        result["reply"] = f"{done} {_task_summary(result['task'])}."
+    else:
+        result["reply"] = f"{failed}: {result.get('message') or result.get('error') or 'unknown error'}."
+    return result
+
+
 def _search(query: str, statuses: tuple | None = None) -> list[dict]:
     """Keyword hits first, then semantic hits that are actually close enough."""
     kw_ids = [t["id"] for t in db.keyword_search(query, limit=10)]
@@ -203,7 +217,7 @@ def _resolve(query: str, statuses: tuple | None = None) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- tool implementations
-# A result with a "reply" key is sent to the user as is, which skips the second LLM call.
+# Every result carries a "reply" that is sent to the user as is. The LLM only picks the tool.
 
 def _exec_create(args: dict) -> dict:
     title = args["title"].strip()
@@ -221,9 +235,7 @@ def _exec_create(args: dict) -> dict:
                     "reply": f"There's already an active task called '{title}'. "
                              f"What should the new one be called?"}
         raise
-    if result["ok"]:
-        vector_store.upsert(result["task"])
-    return result
+    return _finish(result, "Created", "Could not create the task")
 
 
 def _exec_list(args: dict) -> dict:
@@ -284,9 +296,7 @@ def _exec_update(args: dict) -> dict:
                     "reply": f"There's already an active task called '{name}'. "
                              f"Pick a different title, or finish that one first."}
         raise
-    if result["ok"]:
-        vector_store.upsert(result["task"])
-    return result
+    return _finish(result, "Updated", "Could not update the task")
 
 
 # Tasks waiting for the user's "yes". Single user, single process: held in memory.
@@ -367,11 +377,11 @@ def call_model(state: State) -> State:
 
 
 def call_tools(state: State) -> State:
-    log = list(state["tool_log"])
-    new_msgs: list[dict] = []
-    results: list[dict] = []
+    last = state["messages"][-1]
+    tool_log = list(state["tool_log"])
+    replies: list[str] = []
 
-    for tc in state["messages"][-1].get("tool_calls") or []:
+    for tc in last.get("tool_calls") or []:
         name = tc["function"]["name"]
         try:
             args = json.loads(tc["function"]["arguments"] or "{}")
@@ -384,33 +394,33 @@ def call_tools(state: State) -> State:
         fn = _TOOL_MAP.get(name)
         problem = _validate(name, args)
         if fn is None:
-            result = {"ok": False, "error": "UNKNOWN_TOOL", "message": f"Unknown tool: {name}"}
+            result = {"ok": False, "error": "UNKNOWN_TOOL", "reply": "Sorry, I can't do that."}
         elif problem:
-            result = {"ok": False, "error": "INVALID_INPUT", "message": problem}
+            result = {"ok": False, "error": "INVALID_INPUT", "message": problem,
+                      "reply": f"I couldn't do that: {problem}."}
         else:
             try:
                 result = fn(args)
             except Exception as e:  # noqa: BLE001
-                result = {"ok": False, "error": "TOOL_ERROR", "message": str(e)}
+                log.exception("tool %s failed", name)
+                result = {"ok": False, "error": "TOOL_ERROR", "message": str(e),
+                          "reply": "Sorry, that action failed. Please try again."}
 
-        results.append(result)
-        log.append({"name": name, "args": args, "result": result, "tool_call_id": tc["id"]})
-        new_msgs.append({"role": "tool", "tool_call_id": tc["id"],
-                         "content": json.dumps(result, default=str)})
+        replies.append(result["reply"])
+        tool_log.append({"name": name, "args": args, "result": result, "tool_call_id": tc["id"]})
 
-    # If every tool already produced the final wording, skip the extra LLM call.
-    if results and all("reply" in r for r in results):
-        new_msgs.append({"role": "assistant", "content": "\n".join(r["reply"] for r in results)})
+    reply = "\n".join(replies)
+    # The model may add only its out-of-scope note for mixed requests. Any other text is dropped.
+    note = (last.get("content") or "").strip()
+    if note.lower().startswith("ignored"):
+        reply += "\n" + note
 
-    return {"messages": state["messages"] + new_msgs, "tool_log": log}
+    return {"messages": state["messages"] + [{"role": "assistant", "content": reply}],
+            "tool_log": tool_log}
 
 
 def _after_agent(state: State) -> str:
     return "tools" if state["messages"][-1].get("tool_calls") else END
-
-
-def _after_tools(state: State) -> str:
-    return END if state["messages"][-1]["role"] == "assistant" else "agent"
 
 
 _graph = StateGraph(State)
@@ -418,7 +428,7 @@ _graph.add_node("agent", call_model)
 _graph.add_node("tools", call_tools)
 _graph.set_entry_point("agent")
 _graph.add_conditional_edges("agent", _after_agent, {"tools": "tools", END: END})
-_graph.add_conditional_edges("tools", _after_tools, {"agent": "agent", END: END})
+_graph.add_edge("tools", END)
 app_graph = _graph.compile()
 
 
