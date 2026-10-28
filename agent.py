@@ -182,7 +182,7 @@ def call_model(state: State) -> State:
         tools=TOOLS,
         tool_choice="auto",
         temperature=0.1,
-        max_tokens=1024,
+        max_tokens=512,
     )
     msg = resp.choices[0].message
 
@@ -298,7 +298,8 @@ def call_tools(state: State) -> State:
             except Exception as e:  # noqa: BLE001
                 result = {"ok": False, "error": "TOOL_ERROR", "message": str(e)}
 
-        log.append({"name": name, "args": args, "result": result})
+        log.append({"name": name, "args": args, "result": result,
+                    "tool_call_id": tc["id"]})
         tool_msgs.append({
             "role": "tool",
             "tool_call_id": tc["id"],
@@ -346,20 +347,91 @@ def _extract_reply(last) -> str:
         return last.get("content") or ""
     return getattr(last, "content", "") or ""
 
+
 MAX_TURNS = 5
 
-def _trim(history: list[dict]) -> list[dict]:
-    return history[-MAX_TURNS * 2:]
 
-def run_chat(message: str, history: list[dict]) -> dict:
+def _trim(history: list[dict]) -> list[dict]:
+    keep = [m for m in history
+            if m.get("role") in ("user", "assistant")
+            and isinstance(m.get("content"), str)]
+    keep = keep[-MAX_TURNS * 2:]
+    while keep and keep[0]["role"] != "user":
+        keep = keep[1:]
+    return keep
+
+
+LAST_TURN_MAX_CHARS = 2000
+MAX_TOOL_TASKS = 20
+
+
+def _compact_turn(turn: list[dict]) -> list[dict]:
+    """Drop descriptions, cap task lists, so replayed tool results fit the budget."""
+    out: list[dict] = []
+    for m in turn:
+        if m.get("role") != "tool":
+            out.append(m)
+            continue
+        try:
+            r = json.loads(m["content"])
+        except (json.JSONDecodeError, TypeError):
+            out.append(m)
+            continue
+        if isinstance(r, dict) and isinstance(r.get("tasks"), list):
+            if len(r["tasks"]) > MAX_TOOL_TASKS:
+                r["tasks"] = r["tasks"][:MAX_TOOL_TASKS]
+                r["truncated"] = True
+            for task in r["tasks"]:
+                if isinstance(task, dict):
+                    task.pop("description", None)
+            out.append({**m, "content": json.dumps(r, default=str)})
+        else:
+            out.append(m)
+    return out
+
+
+def _build_last_turn(messages: list[dict]) -> list[dict] | None:
+    last_user_idx = -1
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user_idx = i
+    if last_user_idx == -1:
+        return None
+
+    turn = [m for m in messages[last_user_idx + 1:] if isinstance(m, dict)]
+
+    if turn and turn[-1].get("role") == "assistant" and not turn[-1].get("tool_calls"):
+        turn = turn[:-1]
+
+    if not any(m.get("tool_calls") for m in turn):
+        return None
+
+    if len(json.dumps(turn, default=str)) > LAST_TURN_MAX_CHARS:
+        turn = _compact_turn(turn)
+
+    return turn
+
+
+def run_chat(message: str, history: list[dict],
+             last_turn: list[dict] | None = None) -> dict:
     init_messages = [{"role": m["role"], "content": m["content"]} for m in _trim(history)]
+
+    if last_turn:
+        if init_messages and init_messages[-1].get("role") == "assistant":
+            init_messages = init_messages[:-1] + list(last_turn) + [init_messages[-1]]
+        else:
+            init_messages = init_messages + list(last_turn)
+
     init_messages.append({"role": "user", "content": message})
 
     final = app_graph.invoke({"messages": init_messages, "tool_log": []})
     last = final["messages"][-1]
 
-    reply = _extract_reply(last)
     tool_log = final.get("tool_log", [])
-    reply = _ground_reply(reply, tool_log)
+    reply = _ground_reply(_extract_reply(last), tool_log)
 
-    return {"reply": reply or "", "tool_log": tool_log}
+    return {
+        "reply": reply or "",
+        "tool_log": tool_log,
+        "last_turn": _build_last_turn(final["messages"]),
+    }
