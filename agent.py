@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 from datetime import date
 from typing import TypedDict
 
@@ -77,10 +78,20 @@ OPERATING RULES: follow strictly
    - After a bulk delete, list the exact titles that were deleted. If any delete returned ok=false
      or an error, name those tasks and the error.
    - If the tool returned ok=false or an error, say what the error was. Never pretend the
-     action succeeded.
+     action succeeded. (Exception: duplicate-title errors — see rule 8.)
    - If you did not call a tool this turn, do not claim any change occurred.
 
 7. Keep replies short and friendly. Never invent task IDs or task details.
+
+8. DUPLICATE TITLE:
+   If create_task or update_task returns ok=false with error "DUPLICATE_TITLE" (or any
+   message mentioning "UNIQUE"/"constraint"), an active task (todo or in_progress)
+   already has that title.
+   - Do NOT retry the same title.
+   - Do NOT show the raw error to the user.
+   - Tell the user briefly and ask for a different title. Example wording:
+     "There's already an active task called '<title>'. What should the new one be called?"
+   This rule overrides rule 6's "say what the error was" for this specific case.
 
 Be deterministic. Follow the rules exactly."""
 
@@ -214,14 +225,38 @@ def _compact(tasks: list[dict], *, include_description: bool = True) -> list[dic
     return out
 
 
-def _exec_create(args: dict) -> dict:
-    result = db.create_task(
-        title=args["title"],
-        description=args.get("description"),
-        status=args.get("status", "todo"),
-        priority=args.get("priority", "medium"),
-        due_date=args.get("due_date"),
+def _is_duplicate_title_error(exc: Exception) -> bool:
+    """SQLite/Postgres unique-on-title detection."""
+    msg = str(exc).lower()
+    return (
+        ("unique" in msg and "title" in msg)
+        or "uq_tasks_title_active" in msg
+        or "uq_tasks_title" in msg
     )
+
+
+def _exec_create(args: dict) -> dict:
+    try:
+        result = db.create_task(
+            title=args["title"],
+            description=args.get("description"),
+            status=args.get("status", "todo"),
+            priority=args.get("priority", "medium"),
+            due_date=args.get("due_date"),
+        )
+    except sqlite3.IntegrityError as e:
+        if _is_duplicate_title_error(e):
+            return {
+                "ok": False,
+                "error": "DUPLICATE_TITLE",
+                "message": (
+                    f"An active task titled '{args['title']}' already exists "
+                    f"(todo or in_progress). Pick a different title, or mark "
+                    f"the existing one as done first."
+                ),
+            }
+        raise
+
     if result["ok"]:
         vector_store.upsert(result["task"])
     return result
@@ -253,7 +288,22 @@ def _exec_find(args: dict) -> dict:
 def _exec_update(args: dict) -> dict:
     args = dict(args)
     task_id = args.pop("task_id")
-    result = db.update_task(task_id, **args)
+    try:
+        result = db.update_task(task_id, **args)
+    except sqlite3.IntegrityError as e:
+        if _is_duplicate_title_error(e):
+            new_title = args.get("title", "?")
+            return {
+                "ok": False,
+                "error": "DUPLICATE_TITLE",
+                "message": (
+                    f"Cannot update: another active task is already titled "
+                    f"'{new_title}'. Pick a different title, or mark the "
+                    f"existing one as done first."
+                ),
+            }
+        raise
+
     if result["ok"]:
         vector_store.upsert(result["task"])
     return result
