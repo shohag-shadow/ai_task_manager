@@ -38,10 +38,9 @@ OPERATING RULES: follow strictly
 
 2. FIND BEFORE MUTATE: Before update_task or delete_task, you MUST first call find_tasks(query)
    with keywords from the user's request.
-   - For update_task, search ACTIVE tasks only (status 'todo' or 'in_progress'). Exception: if the user clearly
-     refers to a completed task (for example "reopen X"), include 'done' tasks in the search.
-   - For delete_task, search tasks of every status.
-   - If find_tasks cannot exclude completed tasks by itself, discard any result with status 'done' before counting matches.
+   - For update_task, search ACTIVE tasks only: pass status 'todo' or 'in_progress' to find_tasks.
+     Exception: if the user clearly refers to a completed task (for example "reopen X"), pass status 'done'.
+   - For delete_task, search tasks of every status (omit status).
    - 0 results -> tell the user nothing matched and stop.
    - 1 result -> proceed using that task_id.
    - 2+ results -> DO NOT mutate. List the candidates (title + status only) and ask
@@ -135,7 +134,10 @@ TOOLS: list[dict] = [
             "description": "Search tasks by name/keyword (semantic + keyword). Use before update/delete.",
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string"}},
+                "properties": {
+                    "query": {"type": "string"},
+                    "status": {"type": "string", "enum": ["todo", "in_progress", "done"]},
+                },
                 "required": ["query"],
             },
         },
@@ -193,7 +195,7 @@ def call_model(state: State) -> State:
         tools=TOOLS,
         tool_choice="auto",
         temperature=0.1,
-        max_tokens=512,
+        max_tokens=256,
     )
     msg = resp.choices[0].message
 
@@ -231,7 +233,6 @@ def _is_duplicate_title_error(exc: Exception) -> bool:
     return (
         ("unique" in msg and "title" in msg)
         or "uq_tasks_title_active" in msg
-        or "uq_tasks_title" in msg
     )
 
 
@@ -269,6 +270,8 @@ def _exec_list(args: dict) -> dict:
 
 def _exec_find(args: dict) -> dict:
     query = args["query"]
+    status = args.get("status")
+
     vec = vector_store.search(query, n=10)
     vec_ids = [tid for tid, _ in vec]
     kw = db.keyword_search(query, limit=10)
@@ -281,8 +284,19 @@ def _exec_find(args: dict) -> dict:
             seen.add(tid)
             ids.append(tid)
 
-    tasks = db.hydrate(ids)[:5]
-    return {"ok": True, "count": len(tasks), "tasks": _compact(tasks, include_description=False)}
+    hydrated = db.hydrate(ids)
+    if status:
+        hydrated = [t for t in hydrated if t.get("status") == status]
+
+    total = len(hydrated)
+    tasks = hydrated[:5]
+    return {
+        "ok": True,
+        "total": total,
+        "returned": len(tasks),
+        "truncated": total > 5,
+        "tasks": _compact(tasks, include_description=False),
+    }
 
 
 def _exec_update(args: dict) -> dict:
@@ -374,7 +388,8 @@ app_graph = _graph.compile()
 
 
 def _ground_reply(reply: str, tool_log: list[dict]) -> str:
-    """Append the saved task details when the reply leaves the title out."""
+    """Append missing task details or deleted titles so the model can't omit them."""
+    # create / update — append saved task details if the title is missing
     for entry in tool_log:
         if entry.get("name") not in ("create_task", "update_task"):
             continue
@@ -385,14 +400,36 @@ def _ground_reply(reply: str, tool_log: list[dict]) -> str:
         title = task["title"]
         if title.lower() not in reply.lower():
             due = f", due {task['due_date']}" if task.get("due_date") else ""
-            return (reply.rstrip() +
-                    f"\n\n_(Saved as “{title}” · {task['status']} · "
+            reply = (reply.rstrip() +
+                    f"\n\n_(Saved as \"{title}\" · {task['status']} · "
                     f"{task['priority']}{due}.)_")
+            break  # one mutation per turn in practice
+
+    deleted: list[str] = []
+    failed: list[str] = []
+    for entry in tool_log:
+        if entry.get("name") != "delete_task":
+            continue
+        r = entry.get("result") or {}
+        task = r.get("task") or {}
+        if r.get("ok") and task.get("title"):
+            deleted.append(task["title"])
+        elif not r.get("ok"):
+            failed.append(r.get("message") or r.get("error") or "unknown error")
+
+    if deleted:
+        missing = [t for t in deleted
+                if f'"{t}"' not in reply and t.lower() not in reply.lower()]
+        if missing:
+            reply = (reply.rstrip() + "\n\n_Deleted: "
+                    + ", ".join(f'"{t}"' for t in missing) + "._")
+    if failed:
+        reply = reply.rstrip() + "\n\n_Failed: " + "; ".join(failed) + "._"
+
     return reply
 
 
 def _extract_reply(last) -> str:
-    """Return the text of the final assistant message."""
     if isinstance(last, dict):
         return last.get("content") or ""
     return getattr(last, "content", "") or ""
