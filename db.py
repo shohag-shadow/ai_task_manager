@@ -35,7 +35,13 @@ def init_db() -> None:
             updated_at  TEXT NOT NULL
         )
         """)
-
+        # One active task per title (case-insensitive). Completed tasks may be
+        # re-created with the same title.
+        conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_title_active
+        ON tasks (title COLLATE NOCASE)
+        WHERE status IN ('todo', 'in_progress')
+        """)
 
 def make_deterministic_id(title: str) -> str:
     """Build a stable id from the title and the current date."""
