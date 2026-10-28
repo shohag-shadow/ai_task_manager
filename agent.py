@@ -17,8 +17,6 @@ _client = OpenAI(
 
 SYSTEM_PROMPT = """You are a task manager assistant. You control tasks ONLY through the provided tools.
 
-Today's date is {today}.
-
 OPERATING RULES: follow strictly
 0. **MOST IMPORTANT** SCOPE: You only do two things: say hello, and manage tasks using the PROVIDED TOOLS.
    - You are a tool, not a chatbot. Do not chat, give opinions, respond to feelings, or answer general questions.
@@ -176,8 +174,9 @@ def call_model(state: State) -> State:
         messages=[
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT.format(today=date.today().isoformat())
+                "content": SYSTEM_PROMPT
             },
+            {"role": "system", "content": f"Today is {date.today().isoformat()}"},
             *state["messages"],
         ],
         tools=TOOLS,
@@ -204,18 +203,15 @@ def call_model(state: State) -> State:
     return {"messages": state["messages"] + [out]}
 
 
-def _compact(tasks: list[dict]) -> list[dict]:
-    return [
-        {
-            "id": t["id"],
-            "title": t["title"],
-            "description": t.get("description"),
-            "status": t["status"],
-            "priority": t["priority"],
-            "due_date": t.get("due_date"),
-        }
-        for t in tasks
-    ]
+def _compact(tasks: list[dict], *, include_description: bool = True) -> list[dict]:
+    out = []
+    for t in tasks:
+        row = {"id": t["id"], "title": t["title"], "status": t["status"],
+            "priority": t["priority"], "due_date": t.get("due_date")}
+        if include_description:
+            row["description"] = (t.get("description") or "")[:120] or None
+        out.append(row)
+    return out
 
 
 def _exec_create(args: dict) -> dict:
@@ -251,7 +247,7 @@ def _exec_find(args: dict) -> dict:
             ids.append(tid)
 
     tasks = db.hydrate(ids)[:5]
-    return {"ok": True, "count": len(tasks), "tasks": _compact(tasks)}
+    return {"ok": True, "count": len(tasks), "tasks": _compact(tasks, include_description=False)}
 
 
 def _exec_update(args: dict) -> dict:
@@ -350,9 +346,13 @@ def _extract_reply(last) -> str:
         return last.get("content") or ""
     return getattr(last, "content", "") or ""
 
+MAX_TURNS = 5
+
+def _trim(history: list[dict]) -> list[dict]:
+    return history[-MAX_TURNS * 2:]
 
 def run_chat(message: str, history: list[dict]) -> dict:
-    init_messages = [{"role": m["role"], "content": m["content"]} for m in history]
+    init_messages = [{"role": m["role"], "content": m["content"]} for m in _trim(history)]
     init_messages.append({"role": "user", "content": message})
 
     final = app_graph.invoke({"messages": init_messages, "tool_log": []})
